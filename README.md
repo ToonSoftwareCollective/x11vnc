@@ -1,18 +1,11 @@
-# x11vnc with built-in multitouch injection for the Toon 2
+# x11vnc with built-in multitouch injection for the Toon 1 and 2
 
 Clicks and drags from a VNC client are written as Linux multitouch (MT protocol B) events straight into the
 touchscreen event device, so the Toon's qt-gui reacts to them like real finger touches.
 
-## Files
 
-| File | Purpose |
-|------|---------|
-| `x11vnc` | Static ARMv7 hard-float binary (x11vnc 0.9.13 + patch). No shared library dependencies, runs on the Toon 2's glibc 2.21 / kernel 3.14. |
-| `start-toon2-mt-vnc.sh` | `start` / `stop` script, BusyBox sh compatible. |
-| `x11vnc-0.9.13-multitouch.patch` | The source change (`x11vnc/uinput.c`, `x11vnc/help.c`). |
-| `build-x11vnc-toon2.sh` | Reproducible cross-build in WSL/Ubuntu, no root needed. |
 
-## What the patch does
+## What the patch does for Toon 2
 
 Stock x11vnc's `touch` mode writes `ABS_X`, `ABS_Y`, `ABS_PRESSURE`,
 `SYN_REPORT`. Qt's evdevtouch plugin opens the SSD254x touchscreen as a
@@ -43,7 +36,7 @@ The patch also fixes the timestamp handling so the file compiles with
 finger that is still down when x11vnc exits. `x11vnc -help` documents the
 option under `-pipeinput UINPUT`.
 
-### Missing screen updates: following the displayed framebuffer
+### Missing screen updates: fix for Toon 1 and Toon 2
 
 Qt eglfs on the i.MX6 GPU renders into two or three buffers inside
 `/dev/fb0` and pans the display between them (the framebuffer's virtual
@@ -55,17 +48,7 @@ device, map the whole video memory, and re-read the pan offset with
 `FBIOGET_VSCREENINFO` before every polling pass, so the VNC client always
 sees the buffer that is on the LCD. The log shows what was detected:
 
-```
-rawfb: linux fbdev /dev/fb0: 1024x600 (virtual 1024x1800) bpp=32 line_length=4096 smem_len=... pan=0,600
-rawfb: multi-buffered fb, following the displayed buffer (X11VNC_FBDEV_NOPAN=1 disables).
-```
-
-`X11VNC_FBDEV_NOPAN=1` restores the old behaviour, `X11VNC_FBDEV_PAN_DEBUG=1`
-logs every buffer switch. To confirm the diagnosis on the device:
-`cat /sys/class/graphics/fb0/virtual_size` (e.g. `1024,1800`) and
-`cat /sys/class/graphics/fb0/pan` a few times while the GUI changes screens.
-
-## Installation on the Toon 2
+## Installation on the Toon 1 and 2
 
 ```sh
 mkdir -p /usr/local/lib/toon2-x11vnc-mt
@@ -85,21 +68,3 @@ empty by default (no VNC password). Set it to `-usepw` to use the existing
 `~/.vnc/passwd` like the old setup did. Do not comment out lines inside the
 backslash-continued x11vnc command; that silently drops the options after it.
 
-The touchscreen device can be overridden from the environment, e.g.
-`TOUCH_DEVICE=/dev/input/event0 ./start-toon2-mt-vnc.sh start`.
-
-The full command the script runs:
-
-```sh
-x11vnc -forever -shared -rawfb map:/dev/fb0@1024x600x32 $AUTH_OPTS \
-  -pipeinput "UINPUT:mt,touch_always=1,pressure=128,direct_abs=/dev/input/touchscreen0,nouinput" \
-  -o /tmp/x11vnc.log -bg
-```
-
-## Build notes
-
-Cross-compiled in WSL Ubuntu 20.04 with the Bootlin
-`armv7-eabihf--musl--stable-2024.05-1` toolchain, static zlib 1.3.1 and
-libjpeg-turbo 3.0.4 (NEON), `--without-x` (rawfb only). GCC 13 needs
-`-fcommon` for the 2011 sources. `./build-x11vnc-toon2.sh` reproduces the
-binary in `~/toon2work/out/x11vnc`.
