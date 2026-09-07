@@ -69,8 +69,11 @@ logs every buffer switch. To confirm the diagnosis on the device:
 
 ```sh
 mkdir -p /usr/local/lib/toon2-x11vnc-mt
-# copy x11vnc and start-toon2-mt-vnc.sh into that directory (scp/sftp)
+copy x11vnc and start-toon2-mt-vnc.sh into that directory (scp/sftp)
 chmod +x /usr/local/lib/toon2-x11vnc-mt/*
+
+usage:
+
 /usr/local/lib/toon2-x11vnc-mt/start-toon2-mt-vnc.sh start
 /usr/local/lib/toon2-x11vnc-mt/start-toon2-mt-vnc.sh stop
 ```
