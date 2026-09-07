@@ -1,0 +1,507 @@
+--- a/x11vnc/uinput.c	2011-08-11 00:31:32.000000000 +0200
++++ b/x11vnc/uinput.c	2026-09-07 10:44:54.973916200 +0200
+@@ -109,6 +109,19 @@
+ static int touch_pressure = 1;
+ static int abs_x = 0, abs_y = 0;
+ 
++/*
++ * Linux multitouch (MT protocol type B) injection.  Needed when the
++ * target touchscreen is a multitouch device read by e.g. Qt's evdevtouch
++ * plugin (Toon 2 / Solomon SSD254x), which ignores plain ABS_X/ABS_Y
++ * and only reacts to ABS_MT_* + BTN_TOUCH sequences.  Enabled with the
++ * UINPUT option "mt"; tuned with mt_id=, mt_major= and mt_slot=.
++ */
++static int uinput_mt = 0;
++static int mt_tracking_id = 1;
++static int mt_touch_major = 5;
++static int mt_slot = 0;		/* -1: do not send ABS_MT_SLOT */
++static int mt_down = 0;
++
+ static char *devs[] = {
+ 	"/dev/misc/uinput",
+ 	"/dev/input/uinput",
+@@ -207,8 +220,20 @@
+ 	return 0;
+ }
+ 
++#ifdef UINPUT_OK
++static void ptr_abs_mt(int d, int x, int y, int p);
++#endif
++
+ void shutdown_uinput(void) {
+ #ifdef UINPUT_OK
++	/* do not leave a phantom finger on the touchscreen */
++	if (uinput_mt && mt_down) {
++		int d = direct_abs_fd < 0 ? fd : direct_abs_fd;
++		if (d >= 0) {
++			ptr_abs_mt(d, 0, 0, 0);
++		}
++	}
++
+ 	if (fd >= 0) {
+ 		if (db) {
+ 			rfbLog("shutdown_uinput called on fd=%d\n", fd);
+@@ -605,6 +630,8 @@
+ 	uinput_touchscreen = 0;
+ 	uinput_abs = 0;
+ 	abs_x = abs_y = 0;
++	uinput_mt = 0;
++	mt_down = 0;
+ 
+ 	if (tslib_cal) {
+ 		free(tslib_cal);
+@@ -649,6 +676,21 @@
+ 			btn_touch = atoi(p + strlen("btn_touch="));
+ 		} else if (strstr(p, "dragskip=") == p) {
+ 			dragskip = atoi(p + strlen("dragskip="));
++		} else if (strstr(p, "mt_id=") == p) {
++			mt_tracking_id = atoi(p + strlen("mt_id="));
++		} else if (strstr(p, "mt_major=") == p) {
++			mt_touch_major = atoi(p + strlen("mt_major="));
++		} else if (strstr(p, "mt_slot=") == p) {
++			mt_slot = atoi(p + strlen("mt_slot="));
++		} else if (strstr(p, "mt") == p) {
++			/* "mt", "mt=1" or "mt=0": multitouch protocol B injection */
++			q = strchr(p, '=');
++			uinput_mt = q ? atoi(q+1) : 1;
++			if (uinput_mt) {
++				/* implies a touchscreen with absolute coordinates */
++				set_uinput_touchscreen(1);
++				set_uinput_abs(1);
++			}
+ 		} else if (strstr(p, "touch") == p) {
+ 			int gw, gh;
+ 			q = strchr(p, '=');
+@@ -705,7 +747,94 @@
+ 		p = strtok(NULL, ",");
+ 	}
+ 	free(str);
++
++	if (uinput_mt) {
++		rfbLog("uinput: multitouch (MT protocol B) injection enabled: "
++		    "slot=%d tracking_id=%d touch_major=%d\n",
++		    mt_slot, mt_tracking_id, mt_touch_major);
++	}
++}
++
++#ifdef UINPUT_OK
++/*
++ * The kernel expects 16 byte input_event records on 32-bit machines.
++ * With 64-bit time_t C libraries (musl >= 1.2, glibc with _TIME_BITS=64)
++ * the struct keeps that layout but loses its "time" member, so use the
++ * input_event_sec/usec accessors when the header provides them.
++ */
++typedef char x11vnc_input_event_size_check[(sizeof(struct input_event) == 16 || sizeof(long) == 8) ? 1 : -1];
++
++static void ev_stamp(struct input_event *ev) {
++	struct timeval tv;
++	gettimeofday(&tv, NULL);
++#ifdef input_event_sec
++	ev->input_event_sec = tv.tv_sec;
++	ev->input_event_usec = tv.tv_usec;
++#else
++	ev->time = tv;
++#endif
++}
++
++static void ev_send(int d, int type, int code, int value) {
++	struct input_event ev;
++
++	memset(&ev, 0, sizeof(ev));
++	ev_stamp(&ev);
++	ev.type = type;
++	ev.code = code;
++	ev.value = value;
++	write(d, &ev, sizeof(ev));
++}
++
++/*
++ * Emit one multitouch protocol B report for a single contact.
++ *   p > 0 : contact down (press or drag) at x,y
++ *   p == 0: contact released
++ *   p < 0 : position update, only sent while the contact is down
++ * The sequence mirrors what the SSD254x driver produces:  ABS_MT_SLOT,
++ * ABS_MT_TRACKING_ID, ABS_MT_POSITION_X/Y, ABS_MT_TOUCH_MAJOR, BTN_TOUCH,
++ * legacy ABS_X/ABS_Y/ABS_PRESSURE, SYN_REPORT.  The kernel drops values
++ * that did not change, so repeating them is harmless.
++ */
++static void ptr_abs_mt(int d, int x, int y, int p) {
++	if (db) fprintf(stderr, "ptr_abs_mt(%d, %d, p=%d) down=%d fd=%d\n", x, y, p, mt_down, d);
++
++	if (p > 0) {
++		if (mt_slot >= 0) ev_send(d, EV_ABS, ABS_MT_SLOT, mt_slot);
++		if (!mt_down) ev_send(d, EV_ABS, ABS_MT_TRACKING_ID, mt_tracking_id);
++		ev_send(d, EV_ABS, ABS_MT_POSITION_X, x);
++		ev_send(d, EV_ABS, ABS_MT_POSITION_Y, y);
++		ev_send(d, EV_ABS, ABS_MT_TOUCH_MAJOR, mt_touch_major);
++		if (!mt_down) ev_send(d, EV_KEY, BTN_TOUCH, 1);
++		ev_send(d, EV_ABS, ABS_X, x);
++		ev_send(d, EV_ABS, ABS_Y, y);
++		ev_send(d, EV_ABS, ABS_PRESSURE, p);
++		ev_send(d, EV_SYN, SYN_REPORT, 0);
++		mt_down = 1;
++	} else if (p == 0) {
++		if (!mt_down) {
++			return;
++		}
++		if (mt_slot >= 0) ev_send(d, EV_ABS, ABS_MT_SLOT, mt_slot);
++		ev_send(d, EV_ABS, ABS_MT_TRACKING_ID, -1);
++		ev_send(d, EV_KEY, BTN_TOUCH, 0);
++		ev_send(d, EV_ABS, ABS_MT_TOUCH_MAJOR, 0);
++		ev_send(d, EV_ABS, ABS_PRESSURE, 0);
++		ev_send(d, EV_SYN, SYN_REPORT, 0);
++		mt_down = 0;
++	} else {
++		if (!mt_down) {
++			return;
++		}
++		if (mt_slot >= 0) ev_send(d, EV_ABS, ABS_MT_SLOT, mt_slot);
++		ev_send(d, EV_ABS, ABS_MT_POSITION_X, x);
++		ev_send(d, EV_ABS, ABS_MT_POSITION_Y, y);
++		ev_send(d, EV_ABS, ABS_X, x);
++		ev_send(d, EV_ABS, ABS_Y, y);
++		ev_send(d, EV_SYN, SYN_REPORT, 0);
++	}
+ }
++#endif
+ 
+ static void ptr_move(int dx, int dy) {
+ #ifdef UINPUT_OK
+@@ -720,7 +849,7 @@
+ 
+ 	if (db) fprintf(stderr, "ptr_move(%d, %d) fd=%d\n", dx, dy, d);
+ 
+-	gettimeofday(&ev.time, NULL);
++	ev_stamp(&ev);
+ 	ev.type = EV_REL;
+ 	ev.code = REL_Y;
+ 	ev.value = dy;
+@@ -773,7 +902,12 @@
+ 
+ 	if (db) fprintf(stderr, "ptr_abs(%d, %d => %d %d, p=%d) fd=%d\n", x0, y0, x, y, p, d);
+ 
+-	gettimeofday(&ev.time, NULL);
++	if (uinput_mt) {
++		ptr_abs_mt(d, x, y, p);
++		return;
++	}
++
++	ev_stamp(&ev);
+ 	ev.type = EV_ABS;
+ 	ev.code = ABS_Y;
+ 	ev.value = y;
+@@ -952,7 +1086,7 @@
+ 	if (db) fprintf(stderr, "button_click: btn %d %s fd=%d\n", btn, down ? "down" : "up", d);
+ 
+ 	memset(&ev, 0, sizeof(ev));
+-	gettimeofday(&ev.time, NULL);
++	ev_stamp(&ev);
+ 	ev.type = EV_KEY;
+ 	ev.value = down;
+ 
+@@ -1245,7 +1379,7 @@
+ 	if (db) fprintf(stderr, "uinput_key_command: %d -> %d %s fd=%d\n", keysym, scancode, down ? "down" : "up", d);
+ 
+ 	memset(&ev, 0, sizeof(ev));
+-	gettimeofday(&ev.time, NULL);
++	ev_stamp(&ev);
+ 	ev.type = EV_KEY;
+ 	ev.code = (unsigned char) scancode;
+ 	ev.value = down;
+--- a/x11vnc/help.c	2011-08-11 00:31:32.000000000 +0200
++++ b/x11vnc/help.c	2026-09-07 10:36:51.477722500 +0200
+@@ -4887,6 +4887,19 @@
+ "                       touchscreen device, specify pressure=n, e.g. n=5. The\n"
+ "                       default is n=1.\n"
+ "\n"
++"                       If the touchscreen is a Linux multitouch device (the\n"
++"                       reader, e.g. Qt's evdevtouch plugin, ignores plain\n"
++"                       ABS_X/ABS_Y and wants ABS_MT_* events) specify \"mt\".\n"
++"                       This implies \"touch\" and makes x11vnc inject one\n"
++"                       finger using MT protocol B: ABS_MT_SLOT,\n"
++"                       ABS_MT_TRACKING_ID, ABS_MT_POSITION_X/Y,\n"
++"                       ABS_MT_TOUCH_MAJOR, BTN_TOUCH plus the legacy\n"
++"                       ABS_X/ABS_Y/ABS_PRESSURE.  Tune it with mt_id=n\n"
++"                       (tracking id, default 1), mt_major=n (touch major\n"
++"                       value, default 5) and mt_slot=n (slot, default 0;\n"
++"                       -1 sends no ABS_MT_SLOT).  Normally combined with\n"
++"                       direct_abs=<touchscreen event device> and nouinput.\n"
++"\n"
+ "                       If a touch screen is being used (\"touch\" above)\n"
+ "                       and it is having its input processed by tslib, you can\n"
+ "                       specify the tslib calibration file via tslib_cal=<file>.\n"
+@@ -4924,6 +4937,13 @@
+ "\n"
+ "                       (where the long line has been split into two.)\n"
+ "\n"
++"                       this is used on a Toon 2 thermostat (Qt eglfs with a\n"
++"                       multitouch SSD254x touchscreen, no X server):\n"
++"\n"
++"                         -rawfb map:/dev/fb0@1024x600x32 -pipeinput\n"
++"                          UINPUT:mt,touch_always=1,pressure=128,\n"
++"                          direct_abs=/dev/input/touchscreen0,nouinput\n"
++"\n"
+ "                       You can set the env. var X11VNC_UINPUT_DEBUG=1 or higher\n"
+ "                       to get debugging output for UINPUT mode.\n"
+ "\n"
+--- a/x11vnc/x11vnc_defs.c	2011-08-11 00:31:32.000000000 +0200
++++ b/x11vnc/x11vnc_defs.c	2026-09-07 11:11:17.679504500 +0200
+@@ -101,6 +101,7 @@
+ char *raw_fb = NULL;		/* when used should be main_fb */
+ char *raw_fb_addr = NULL;
+ int raw_fb_offset = 0;
++int raw_fb_pan_offset = 0;	/* linux fbdev: byte offset of the currently displayed (panned) buffer */
+ int raw_fb_shm = 0;
+ int raw_fb_mmap = 0;
+ int raw_fb_seek = 0;
+--- a/x11vnc/x11vnc.h	2011-08-11 00:31:32.000000000 +0200
++++ b/x11vnc/x11vnc.h	2026-09-07 11:11:20.529503200 +0200
+@@ -529,6 +529,7 @@
+ extern char *raw_fb;
+ extern char *raw_fb_addr;
+ extern int raw_fb_offset;
++extern int raw_fb_pan_offset;
+ extern int raw_fb_shm;
+ extern int raw_fb_mmap;
+ extern int raw_fb_seek;
+--- a/x11vnc/screen.h	2011-08-11 00:31:32.000000000 +0200
++++ b/x11vnc/screen.h	2026-09-07 11:11:23.429502100 +0200
+@@ -55,6 +55,7 @@
+ extern void set_vnc_desktop_name(void);
+ extern void announce(int lport, int ssl, char *iface);
+ extern int rawfb_vnc_reflect_init_client(void);
++extern void raw_fb_update_pan(void);
+ 
+ extern char *vnc_reflect_guess(char *str, char **raw_fb_addr);
+ extern void vnc_reflect_process_client(void);
+--- a/x11vnc/screen.c	2011-08-11 00:31:32.000000000 +0200
++++ b/x11vnc/screen.c	2026-09-07 11:11:50.819497400 +0200
+@@ -64,6 +64,29 @@
+ 
+ #include <rfb/rfbclient.h>
+ 
++#if LIBVNCSERVER_HAVE_SYS_IOCTL_H
++#include <sys/ioctl.h>
++#endif
++#if LIBVNCSERVER_HAVE_LINUX_FB_H
++#include <linux/fb.h>
++#endif
++
++/*
++ * Linux framebuffer devices that are double/triple buffered (e.g. Qt eglfs
++ * on i.MX6 with the Vivante GPU) pan the display between several buffers
++ * inside /dev/fb0.  A plain "map:/dev/fb0@WxHxB" only ever reads the
++ * first buffer, so the VNC picture goes stale whenever another buffer is
++ * on screen.  When the rawfb file turns out to be a fbdev we map the whole
++ * video memory and re-read the pan offset (FBIOGET_VSCREENINFO) before
++ * every polling pass; copy_raw_fb() adds raw_fb_pan_offset to its source.
++ * Set X11VNC_FBDEV_NOPAN=1 to disable, X11VNC_FBDEV_PAN_DEBUG=1 to log.
++ */
++static int raw_fb_fbdev = 0;
++static int raw_fb_fbdev_line_length = 0;
++static int raw_fb_fbdev_smem_len = 0;
++static int raw_fb_fbdev_visible = 0;
++void raw_fb_update_pan(void);
++
+ void set_greyscale_colormap(void);
+ void set_hi240_colormap(void);
+ void unset_colormap(void);
+@@ -1485,6 +1508,50 @@
+ 	return rfbInitClient(client, &client_argc, client_argv);	
+ }
+ 
++/*
++ * Re-read the fbdev pan position and turn it into a byte offset that
++ * copy_raw_fb() adds to the mapped/seeked source.  Called once per
++ * polling pass, so it costs one ioctl per pass.
++ */
++void raw_fb_update_pan(void) {
++#if LIBVNCSERVER_HAVE_LINUX_FB_H
++#if LIBVNCSERVER_HAVE_SYS_IOCTL_H
++	struct fb_var_screeninfo var;
++	int off;
++	static int db = -1, warned = 0;
++
++	if (!raw_fb_fbdev || raw_fb_fd < 0) {
++		return;
++	}
++	if (db < 0) {
++		db = getenv("X11VNC_FBDEV_PAN_DEBUG") ? 1 : 0;
++	}
++	if (ioctl(raw_fb_fd, FBIOGET_VSCREENINFO, &var) == -1) {
++		return;
++	}
++	off = (int) var.yoffset * raw_fb_fbdev_line_length +
++	    (int) var.xoffset * ((int) var.bits_per_pixel / 8);
++
++	if (off < 0 || raw_fb_offset + off + raw_fb_fbdev_visible > raw_fb_fbdev_smem_len) {
++		if (!warned) {
++			rfbLog("rawfb: pan offset %d (yoffset=%d xoffset=%d) is outside the"
++			    " mapped video memory (%d bytes), ignoring pan.\n", off,
++			    var.yoffset, var.xoffset, raw_fb_fbdev_smem_len);
++			warned = 1;
++		}
++		off = 0;
++	}
++	if (off != raw_fb_pan_offset) {
++		if (db) {
++			rfbLog("rawfb: pan offset %d -> %d (yoffset=%d xoffset=%d)\n",
++			    raw_fb_pan_offset, off, var.yoffset, var.xoffset);
++		}
++		raw_fb_pan_offset = off;
++	}
++#endif
++#endif
++}
++
+ char *vnc_reflect_guess(char *str, char **raw_fb_addr) {
+ 
+ 	static int first = 1;
+@@ -1899,6 +1966,8 @@
+ 	raw_fb_fd = -1;
+ 	raw_fb_addr = NULL;
+ 	raw_fb_offset = 0;
++	raw_fb_pan_offset = 0;
++	raw_fb_fbdev = 0;
+ 	raw_fb_bytes_per_line = 0;
+ 	rawfb_vnc_reflect = 0;
+ 
+@@ -2235,6 +2304,43 @@
+ 			}
+ 		}
+ 
++#if LIBVNCSERVER_HAVE_LINUX_FB_H
++#if LIBVNCSERVER_HAVE_SYS_IOCTL_H
++		if (!do_macosx && !do_reflect && !getenv("X11VNC_FBDEV_NOPAN")) {
++			struct fb_fix_screeninfo fix;
++			struct fb_var_screeninfo var;
++
++			if (ioctl(fd, FBIOGET_FSCREENINFO, &fix) != -1 &&
++			    ioctl(fd, FBIOGET_VSCREENINFO, &var) != -1 &&
++			    fix.line_length > 0 && fix.smem_len > 0) {
++				raw_fb_fbdev = 1;
++				raw_fb_fbdev_line_length = (int) fix.line_length;
++				raw_fb_fbdev_smem_len = (int) fix.smem_len;
++				raw_fb_fbdev_visible = (int) var.yres * (int) fix.line_length;
++
++				if (raw_fb_bytes_per_line == 0 && raw_fb_native_bpp >= 8) {
++					/* xres_virtual may be wider than xres */
++					raw_fb_bytes_per_line = (int) fix.line_length;
++				}
++				if ((int) fix.smem_len > size) {
++					/* map all buffers, not just the first one */
++					size = (int) fix.smem_len;
++				}
++				rfbLog("rawfb: linux fbdev %s: %dx%d (virtual %dx%d) bpp=%d"
++				    " line_length=%d smem_len=%d pan=%d,%d\n", q,
++				    var.xres, var.yres, var.xres_virtual, var.yres_virtual,
++				    var.bits_per_pixel, fix.line_length, fix.smem_len,
++				    var.xoffset, var.yoffset);
++				if (var.yres_virtual > var.yres || var.xres_virtual > var.xres) {
++					rfbLog("rawfb: multi-buffered fb, following the displayed"
++					    " buffer (X11VNC_FBDEV_NOPAN=1 disables).\n");
++				}
++				raw_fb_update_pan();
++			}
++		}
++#endif
++#endif
++
+ 		if (do_macosx) {
+ 			raw_fb_addr = macosx_get_fb_addr();
+ 			raw_fb_mmap = size;
+@@ -2390,7 +2496,7 @@
+ 	if (clipshift || raw_fb_native_bpp < 8) {
+ 		memset(raw_fb, 0xff, dpy_y * raw_fb_image->bytes_per_line);
+ 	} else if (raw_fb_addr && ! xform24to32) {
+-		memcpy(raw_fb, raw_fb_addr + raw_fb_offset, dpy_y * raw_fb_image->bytes_per_line);
++		memcpy(raw_fb, raw_fb_addr + raw_fb_offset + raw_fb_pan_offset, dpy_y * raw_fb_image->bytes_per_line);
+ 	} else {
+ 		memset(raw_fb, 0xff, dpy_y * raw_fb_image->bytes_per_line);
+ 	}
+--- a/x11vnc/xwrappers.c	2011-08-11 00:31:32.000000000 +0200
++++ b/x11vnc/xwrappers.c	2026-09-07 11:12:05.029495300 +0200
+@@ -612,7 +612,7 @@
+ 		if (clipshift && wdpy_x != cdpy_x) {
+ 			bpl = wdpy_x * 3;
+ 		}
+-		src = raw_fb_addr + raw_fb_offset + bpl*y + 3*x;
++		src = raw_fb_addr + raw_fb_offset + raw_fb_pan_offset + bpl*y + 3*x;
+ 		dst = dest->data;
+ 
+ 		if (use_snapfb && dest == snap) {
+@@ -640,7 +640,7 @@
+ 		if (clipshift && wdpy_x != cdpy_x) {
+ 			bpl = wdpy_x * 3;
+ 		}
+-		off = (off_t) (raw_fb_offset + bpl*y + 3*x);
++		off = (off_t) (raw_fb_offset + raw_fb_pan_offset + bpl*y + 3*x);
+ 
+ 		lseek(raw_fb_fd, off, SEEK_SET);
+ 		dst = dest->data;
+@@ -741,10 +741,10 @@
+ 			bpl = wdpy_x * pixelsize;
+ 		}
+ 
+-		src = raw_fb_addr + raw_fb_offset + bpl*y + pixelsize*x;
++		src = raw_fb_addr + raw_fb_offset + raw_fb_pan_offset + bpl*y + pixelsize*x;
+ 		dst = dest->data;
+ 
+-if (db) fprintf(stderr, "bpl: %d, dest->bytes_per_line: %d, w: %d h: %d dpy_x: %d wdpy_x: %d cdpy_x: %d bpp: %d pixelsize: %d\n", bpl, dest->bytes_per_line, w, h, dpy_x, wdpy_x, cdpy_x, bpp, pixelsize);
++if (db) fprintf(stderr, "bpl: %d, dest->bytes_per_line: %d, w: %d h: %d dpy_x: %d wdpy_x: %d cdpy_x: %d bpp: %d pixelsize: %d pan: %d\n", bpl, dest->bytes_per_line, w, h, dpy_x, wdpy_x, cdpy_x, bpp, pixelsize, raw_fb_pan_offset);
+ 
+ 		for (line = 0; line < h; line++) {
+ 			memcpy(dst, src, w * pixelsize);
+@@ -762,7 +762,7 @@
+ 			bpl = wdpy_x * pixelsize;
+ 		}
+ 
+-		off = (off_t) (raw_fb_offset + bpl*y + pixelsize*x);
++		off = (off_t) (raw_fb_offset + raw_fb_pan_offset + bpl*y + pixelsize*x);
+ 
+ 		lseek(raw_fb_fd, off, SEEK_SET);
+ 		dst = dest->data;
+--- a/x11vnc/scan.c	2011-08-11 00:31:32.000000000 +0200
++++ b/x11vnc/scan.c	2026-09-07 11:12:31.149489200 +0200
+@@ -2425,6 +2425,10 @@
+ 		return 0;
+ 	}
+ 
++	if (raw_fb) {
++		raw_fb_update_pan();
++	}
++
+ 	block_size = ((dpy_y/fs_factor) * main_bytes_per_line);
+ 
+ 	fbp = main_fb;
+@@ -3361,7 +3365,7 @@
+ 	double dtmp = 0.0;
+ 
+ 	if (unixpw_in_progress) return 0;
+- 
++
+ 	if (slow_fb > 0.0) {
+ 		double now = dnow();
+ 		if (now < last_poll + slow_fb) {
+@@ -3370,6 +3374,11 @@
+ 		last_poll = now;
+ 	}
+ 
++	if (raw_fb) {
++		/* multi-buffered linux fbdev: read from the buffer on screen */
++		raw_fb_update_pan();
++	}
++
+ 	for (i=0; i < ntiles; i++) {
+ 		tile_has_diff[i] = 0;
+ 		tile_has_xdamage_diff[i] = 0;
+--- a/x11vnc/remote.c	2011-08-11 00:31:32.000000000 +0200
++++ b/x11vnc/remote.c	2026-09-07 11:12:07.929494700 +0200
+@@ -5141,6 +5141,7 @@
+ 			raw_fb = NULL;
+ 			raw_fb_addr = NULL;
+ 			raw_fb_offset = 0;
++			raw_fb_pan_offset = 0;
+ 			raw_fb_shm = 0;
+ 			raw_fb_mmap = 0;
+ 			raw_fb_seek = 0;
