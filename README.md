@@ -48,7 +48,7 @@ device, map the whole video memory, and re-read the pan offset with
 `FBIOGET_VSCREENINFO` before every polling pass, so the VNC client always
 sees the buffer that is on the LCD. The log shows what was detected:
 
-## Installation on the Toon 1 and 2
+## Installation on the Toon 1 and 2 (filenames from Toon 2 folder, replace with Toon 1 filename on that device)
 
 ```sh
 mkdir -p /usr/local/lib/toon2-x11vnc-mt
